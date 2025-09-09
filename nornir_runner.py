@@ -163,6 +163,18 @@ class Defaults:
     workers: int | None
     timeout: int | None
     enable_secret: str | None
+    # Extended config options the user may prefer to set in defaults file
+    mode: str | None
+    hosts: List[str]
+    hosts_file: str | None
+    commands: List[str]
+    commands_file: str | None
+    inventory_dir: str | None
+    save_dir: str | None
+    per_command_output: bool | None
+    quiet: bool | None
+    dry_run: bool | None
+    env_file: str | None
 
 
 def parse_credentials_mixed(value) -> List[Tuple[str, str]]:
@@ -201,7 +213,25 @@ def parse_credentials_mixed(value) -> List[Tuple[str, str]]:
 def load_defaults_file(path: str | Path | None) -> Defaults:
     if not path:
         # empty defaults; env/CLI must provide
-        return Defaults(ports=[], credentials=[], platform=None, workers=None, timeout=None, enable_secret=None)
+        return Defaults(
+            ports=[],
+            credentials=[],
+            platform=None,
+            workers=None,
+            timeout=None,
+            enable_secret=None,
+            mode=None,
+            hosts=[],
+            hosts_file=None,
+            commands=[],
+            commands_file=None,
+            inventory_dir=None,
+            save_dir=None,
+            per_command_output=None,
+            quiet=None,
+            dry_run=None,
+            env_file=None,
+        )
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"Defaults file not found: {p}")
@@ -243,7 +273,78 @@ def load_defaults_file(path: str | Path | None) -> Defaults:
     enable_secret = data.get("enable_secret")
     enable_secret = str(enable_secret) if enable_secret is not None else None
 
-    return Defaults(ports=ports, credentials=credentials, platform=platform, workers=workers, timeout=timeout, enable_secret=enable_secret)
+    # Extended options
+    mode = data.get("mode")
+    mode = str(mode) if mode is not None else None
+
+    # hosts: list or comma-separated string
+    hosts_list: List[str] = []
+    hosts_val = data.get("hosts")
+    if isinstance(hosts_val, list):
+        hosts_list = [str(h).strip() for h in hosts_val if str(h).strip()]
+    elif isinstance(hosts_val, str):
+        hosts_list = [h.strip() for h in hosts_val.split(",") if h.strip()]
+
+    hosts_file = data.get("hosts_file")
+    hosts_file = str(hosts_file) if hosts_file is not None else None
+
+    # commands: list or comma-separated string
+    commands_list: List[str] = []
+    commands_val = data.get("commands")
+    if isinstance(commands_val, list):
+        commands_list = [str(c).strip() for c in commands_val if str(c).strip()]
+    elif isinstance(commands_val, str):
+        commands_list = [c.strip() for c in commands_val.split(",") if c.strip()]
+
+    commands_file = data.get("commands_file")
+    commands_file = str(commands_file) if commands_file is not None else None
+
+    inventory_dir = data.get("inventory_dir")
+    inventory_dir = str(inventory_dir) if inventory_dir is not None else None
+
+    save_dir = data.get("save_dir")
+    save_dir = str(save_dir) if save_dir is not None else None
+
+    per_command_output = data.get("per_command_output")
+    if isinstance(per_command_output, bool):
+        pass
+    else:
+        per_command_output = None
+
+    quiet = data.get("quiet")
+    if isinstance(quiet, bool):
+        pass
+    else:
+        quiet = None
+
+    dry_run = data.get("dry_run")
+    if isinstance(dry_run, bool):
+        pass
+    else:
+        dry_run = None
+
+    env_file = data.get("env_file")
+    env_file = str(env_file) if env_file is not None else None
+
+    return Defaults(
+        ports=ports,
+        credentials=credentials,
+        platform=platform,
+        workers=workers,
+        timeout=timeout,
+        enable_secret=enable_secret,
+        mode=mode,
+        hosts=hosts_list,
+        hosts_file=hosts_file,
+        commands=commands_list,
+        commands_file=commands_file,
+        inventory_dir=inventory_dir,
+        save_dir=save_dir,
+        per_command_output=per_command_output,
+        quiet=quiet,
+        dry_run=dry_run,
+        env_file=env_file,
+    )
 
 
 def normalize_platform(platform: str) -> str:
@@ -382,7 +483,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     p.add_argument("--hosts-file", help="File with one host per line")
     p.add_argument("--commands", help="Comma-separated commands to run (quote if needed)")
     p.add_argument("--commands-file", help="File with one command per line")
-    p.add_argument("--mode", choices=["show", "config"], default=os.getenv("NORNIR_MODE", "show"))
+    p.add_argument("--mode", choices=["show", "config"], default=None)
     p.add_argument("--ports", help="Comma-separated SSH ports to try (e.g. 22,2222)")
     p.add_argument("--workers", type=int, default=None)
     p.add_argument(
@@ -394,7 +495,13 @@ def main(argv: Iterable[str] | None = None) -> int:
     p.add_argument("--dry-run", action="store_true", help="Do not push config; print what would be sent")
     p.add_argument("--env-file", help="Path to .env file to load")
     p.add_argument("--timeout", type=int, default=None, help="Command/connect timeout seconds")
-    p.add_argument("--defaults-file", help="Path to defaults file (YAML/JSON) with ports, credentials, platform, workers, timeout, enable_secret")
+    p.add_argument(
+        "--defaults-file",
+        help=(
+            "Path to defaults file (YAML/JSON) with ports, credentials, platform, workers, timeout, enable_secret, "
+            "and optionally hosts/hosts_file, commands/commands_file, inventory_dir, save_dir, per_command_output, quiet, dry_run, env_file"
+        ),
+    )
     p.add_argument("--save-dir", help="Directory to save per-host outputs (optional)")
     p.add_argument(
         "--per-command-output",
@@ -409,18 +516,29 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     args = p.parse_args(list(argv) if argv is not None else None)
 
-    # Load env
-    load_env(args.env_file)
+    # Load defaults file (if provided) early so it can influence env/paths
+    defaults = load_defaults_file(args.defaults_file)
+
+    # Load env (CLI overrides defaults)
+    load_env(args.env_file or defaults.env_file)
 
     # Gather hosts unless using inventory-dir
-    use_inventory_dir = bool(args.inventory_dir)
+    inv_dir_opt = args.inventory_dir or defaults.inventory_dir
+    use_inventory_dir = bool(inv_dir_opt)
     hosts_raw: List[str] = []
     hosts_with_plat: List[Tuple[str, str | None]] = []
     if not use_inventory_dir:
+        # CLI hosts first
         if args.hosts:
             hosts_raw.extend(parse_list_arg(args.hosts))
         if args.hosts_file:
             hosts_raw.extend(read_lines_file(args.hosts_file))
+        # Defaults fallback if still empty
+        if not hosts_raw:
+            if defaults.hosts:
+                hosts_raw.extend([h.strip() for h in defaults.hosts if h.strip()])
+            if defaults.hosts_file:
+                hosts_raw.extend(read_lines_file(defaults.hosts_file))
         hosts_raw = [h for h in (x.strip() for x in hosts_raw) if h]
         if not hosts_raw:
             print("Error: no hosts provided (use --hosts/--hosts-file or --inventory-dir)", file=sys.stderr)
@@ -434,12 +552,15 @@ def main(argv: Iterable[str] | None = None) -> int:
         commands.extend([c.strip() for c in args.commands.split(",") if c.strip()])
     if args.commands_file:
         commands.extend(read_lines_file(args.commands_file))
+    # Defaults fallback if still empty
+    if not commands:
+        if defaults.commands:
+            commands.extend([c.strip() for c in defaults.commands if c.strip()])
+        if defaults.commands_file:
+            commands.extend(read_lines_file(defaults.commands_file))
     if not commands:
         print("Error: no commands provided (use --commands or --commands-file)", file=sys.stderr)
         return 2
-
-    # Load defaults file (if provided) and merge with CLI/env
-    defaults = load_defaults_file(args.defaults_file)
 
     # Ports precedence: CLI > defaults file > env > 22
     ports: List[int] = []
@@ -464,7 +585,8 @@ def main(argv: Iterable[str] | None = None) -> int:
     # Enable secret precedence: CLI has no flag; defaults file > env
     enable_secret = defaults.enable_secret or os.getenv("NORNIR_ENABLE_SECRET") or None
 
-    # Resolve baseline platform/workers/timeout with precedence: CLI > defaults file > env/defaults
+    # Resolve baseline mode/platform/workers/timeout with precedence: CLI > defaults file > env/defaults
+    effective_mode = (args.mode or defaults.mode or os.getenv("NORNIR_MODE", "show"))
     effective_platform = normalize_platform(
         (args.platform or defaults.platform or os.getenv("NORNIR_PLATFORM") or "cisco_ios")
     )
@@ -473,7 +595,7 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     # Build Nornir instance
     if use_inventory_dir:
-        inv_dir = Path(args.inventory_dir)
+        inv_dir = Path(inv_dir_opt)  # type: ignore[arg-type]
         hosts_file = str(inv_dir / "hosts.yaml")
         groups_file = str(inv_dir / "groups.yaml")
         defaults_file = str(inv_dir / "defaults.yaml")
@@ -510,21 +632,26 @@ def main(argv: Iterable[str] | None = None) -> int:
         nr = NornirCore(inventory=inv, runner=runner_obj, config=cfg)
 
     # Run task over all hosts
+    # Effective booleans/flags merged with defaults (CLI overrides)
+    effective_per_cmd_out = bool(args.per_command_output or (defaults.per_command_output is True))
+    effective_quiet = bool(args.quiet or (defaults.quiet is True))
+    effective_dry_run = bool(args.dry_run or (defaults.dry_run is True))
+
     result = nr.run(
-        name=f"run-{args.mode}",
+        name=f"run-{effective_mode}",
         task=try_connect_and_run,
         commands=commands,
-        mode=args.mode,
+        mode=effective_mode,
         ports=ports,
         cred_pairs=creds,
         platform=effective_platform,
         enable_secret=enable_secret,
         cmd_timeout=int(effective_timeout),
-        dry_run=bool(args.dry_run),
-        per_command_output=bool(args.per_command_output),
+        dry_run=effective_dry_run,
+        per_command_output=effective_per_cmd_out,
     )
 
-    if not args.quiet:
+    if not effective_quiet:
         print_result(result)
     else:
         # Quiet mode: print only raw outputs (final task result per host)
@@ -538,8 +665,9 @@ def main(argv: Iterable[str] | None = None) -> int:
                     pass
 
     # Optional save outputs per host
-    if args.save_dir:
-        outdir = Path(args.save_dir)
+    save_dir_opt = args.save_dir or defaults.save_dir
+    if save_dir_opt:
+        outdir = Path(save_dir_opt)
         outdir.mkdir(parents=True, exist_ok=True)
         for host, multi_result in result.items():
             # The final return from try_connect_and_run is the last child Result
