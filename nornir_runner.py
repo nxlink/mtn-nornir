@@ -120,16 +120,19 @@ class ProgressTable:
 
     @staticmethod
     def _color_status(status: str) -> str:
-        s = status.lower()
-        if s.startswith("done") or s.startswith("connected"):
-            color = ProgressTable.FG_GREEN
-        elif s.startswith("failed") or s.startswith("error"):
+        # Normalize for matching: trim padding and leading spinner/symbols
+        s = status.strip().lower()
+        # remove any leading spinner and space
+        s = s.lstrip("⣾⣽⣻⢿⡿⣟⣯⣷ ")
+        if ("failed" in s) or ("error" in s):
             color = ProgressTable.FG_RED
+        elif ("done" in s) or ("connected" in s):
+            color = ProgressTable.FG_GREEN
         elif s.startswith("config"):
             color = ProgressTable.FG_MAGENTA
         elif s.startswith("show"):
             color = ProgressTable.FG_CYAN
-        elif s.startswith("connect") or s.startswith("starting"):
+        elif ("connect" in s) or s.startswith("starting"):
             color = ProgressTable.FG_YELLOW
         elif s == "idle":
             color = ProgressTable.DIM
