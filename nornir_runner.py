@@ -81,6 +81,17 @@ except Exception:  # pragma: no cover
     SSHException = tuple()  # type: ignore
 
 
+def announce(task: Task, message: str, level: int = logging.INFO, live: bool | None = None) -> Result:
+    """Lightweight subtask to emit progress messages and optionally print live."""
+    if live:
+        try:
+            sys.stdout.write(f"[{task.host.name}] {message}\n")
+            sys.stdout.flush()
+        except Exception:
+            pass
+    return Result(host=task.host, result=message, changed=False, severity_level=level)
+
+
 def parse_list_arg(value: str | None) -> List[str]:
     if not value:
         return []
@@ -175,6 +186,7 @@ class Defaults:
     quiet: bool | None
     dry_run: bool | None
     env_file: str | None
+    live_progress: bool | None
 
 
 def parse_credentials_mixed(value) -> List[Tuple[str, str]]:
@@ -231,6 +243,7 @@ def load_defaults_file(path: str | Path | None) -> Defaults:
             quiet=None,
             dry_run=None,
             env_file=None,
+            live_progress=None,
         )
     p = Path(path)
     if not p.exists():
@@ -326,6 +339,12 @@ def load_defaults_file(path: str | Path | None) -> Defaults:
     env_file = data.get("env_file")
     env_file = str(env_file) if env_file is not None else None
 
+    live_progress = data.get("live_progress")
+    if isinstance(live_progress, bool):
+        pass
+    else:
+        live_progress = None
+
     return Defaults(
         ports=ports,
         credentials=credentials,
@@ -344,6 +363,7 @@ def load_defaults_file(path: str | Path | None) -> Defaults:
         quiet=quiet,
         dry_run=dry_run,
         env_file=env_file,
+        live_progress=live_progress,
     )
 
 
@@ -397,11 +417,16 @@ def try_connect_and_run(
     cmd_timeout: int,
     dry_run: bool,
     per_command_output: bool,
+    suppress_output: bool,
+    live_progress: bool,
 ) -> Result:
     last_err: str | None = None
 
+    attempt = 0
     for port in ports:
         for username, password in cred_pairs:
+            attempt += 1
+            task.run(task=announce, message=f"Attempt {attempt}: connect {task.host.hostname}:{port} as {username}", live=live_progress)
             # Reset connection with new options each attempt
             task.host.close_connections()
             device_type = normalize_platform(getattr(task.host, "platform", None) or platform)
@@ -422,14 +447,17 @@ def try_connect_and_run(
             # Attempt to open the connection explicitly to avoid noisy failed task results
             try:
                 task.host.get_connection("netmiko", task.nornir.config)
+                task.run(task=announce, message=f"Connected: {task.host.hostname}:{port} as {username}", live=live_progress)
             except (Exception,) as e:
                 # Gracefully skip bad credentials/ports without creating failed child results
                 last_err = f"{type(e).__name__}: {e} (user={username}, port={port})"
+                task.run(task=announce, message=f"Failed attempt {attempt}: {last_err}", level=logging.WARNING, live=live_progress)
                 continue
 
             # Connection established; now run commands as tasks (these will reuse the open connection)
             try:
                 if mode == "show":
+                    task.run(task=announce, message=f"Sending {len(commands)} command(s) in show mode", live=live_progress)
                     outputs = []
                     for cmd in commands:
                         r = task.run(
@@ -438,37 +466,56 @@ def try_connect_and_run(
                             command_string=cmd,
                             enable=bool(enable_secret),
                             use_textfsm=False,
-                            severity_level=(logging.INFO if per_command_output else logging.DEBUG),
+                            severity_level=(logging.INFO if (per_command_output and not suppress_output) else logging.DEBUG),
                         )
                         outputs.append(str(r.result))
                     aggregated = "\n".join(outputs)
                     task.host["used_username"] = username
                     task.host["used_port"] = port
                     if per_command_output:
-                        return Result(host=task.host, result=aggregated, changed=False, severity_level=logging.DEBUG)
+                        # with per-command output, final aggregation is auxiliary; keep low severity
+                        res = Result(host=task.host, result=aggregated, changed=False, severity_level=logging.DEBUG)
                     else:
-                        return Result(host=task.host, result=aggregated, changed=False)
+                        res = Result(host=task.host, result=aggregated, changed=False, severity_level=(logging.DEBUG if suppress_output else logging.INFO))
+                    # Close connection and announce
+                    try:
+                        task.host.close_connections()
+                    finally:
+                        task.run(task=announce, message="Closed connection", live=live_progress)
+                    return res
                 else:  # config mode
                     if dry_run:
                         preview = "\n".join(commands)
                         task.host["used_username"] = username
                         task.host["used_port"] = port
-                        return Result(host=task.host, result=f"DRY-RUN (no changes):\n{preview}", changed=False)
+                        res = Result(host=task.host, result=f"DRY-RUN (no changes):\n{preview}", changed=False, severity_level=(logging.DEBUG if suppress_output else logging.INFO))
+                        try:
+                            task.host.close_connections()
+                        finally:
+                            task.run(task=announce, message="Closed connection", live=live_progress)
+                        return res
                     else:
+                        task.run(task=announce, message=f"Sending {len(commands)} command(s) in config mode")
                         r = task.run(
                             name=f"{task.host.name} | config",
                             task=netmiko_send_config,
                             config_commands=list(commands),
-                            severity_level=(logging.INFO if per_command_output else logging.DEBUG),
+                            severity_level=(logging.INFO if (per_command_output and not suppress_output) else logging.DEBUG),
                         )
                         task.host["used_username"] = username
                         task.host["used_port"] = port
                         if per_command_output:
-                            return Result(host=task.host, result=str(r.result), changed=True, severity_level=logging.DEBUG)
+                            res = Result(host=task.host, result=str(r.result), changed=True, severity_level=logging.DEBUG)
                         else:
-                            return Result(host=task.host, result=str(r.result), changed=True)
+                            res = Result(host=task.host, result=str(r.result), changed=True, severity_level=(logging.DEBUG if suppress_output else logging.INFO))
+                        try:
+                            task.host.close_connections()
+                        finally:
+                            task.run(task=announce, message="Closed connection")
+                        return res
             except Exception as e:
                 last_err = f"{type(e).__name__}: {e} (user={username}, port={port})"
+                task.run(task=announce, message=f"Error during session: {last_err}", level=logging.WARNING, live=live_progress)
                 continue
 
     # Exhausted all attempts
@@ -507,6 +554,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         "--per-command-output",
         action="store_true",
         help="Print each command result per host; hide aggregated block",
+    )
+    p.add_argument(
+        "--live-progress",
+        action="store_true",
+        help="Stream real-time progress of connection attempts and steps",
     )
     p.add_argument(
         "--quiet",
@@ -637,6 +689,12 @@ def main(argv: Iterable[str] | None = None) -> int:
     effective_quiet = bool(args.quiet or (defaults.quiet is True))
     effective_dry_run = bool(args.dry_run or (defaults.dry_run is True))
 
+    # Determine if we should suppress printing command outputs when saving
+    save_dir_opt = args.save_dir or defaults.save_dir
+    suppress_output = bool(save_dir_opt)
+
+    effective_live_progress = bool(args.live_progress or (defaults.live_progress is True))
+
     result = nr.run(
         name=f"run-{effective_mode}",
         task=try_connect_and_run,
@@ -649,7 +707,13 @@ def main(argv: Iterable[str] | None = None) -> int:
         cmd_timeout=int(effective_timeout),
         dry_run=effective_dry_run,
         per_command_output=effective_per_cmd_out,
+        suppress_output=suppress_output,
+        live_progress=effective_live_progress,
     )
+
+    # When saving outputs, suppress printing raw command output to screen but keep progress
+    if suppress_output:
+        effective_quiet = False
 
     if not effective_quiet:
         print_result(result)
@@ -665,7 +729,6 @@ def main(argv: Iterable[str] | None = None) -> int:
                     pass
 
     # Optional save outputs per host
-    save_dir_opt = args.save_dir or defaults.save_dir
     if save_dir_opt:
         outdir = Path(save_dir_opt)
         outdir.mkdir(parents=True, exist_ok=True)

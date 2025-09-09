@@ -89,6 +89,7 @@ Outputs
 -------
 
 - Results print to stdout. Optionally save per-host output files with `--save-dir outputs` or by setting `save_dir` in the defaults file.
+- When `save_dir` is set, command output is suppressed on screen and only progress/status is shown; outputs are written to files.
 
 Notes
 -----
@@ -194,5 +195,6 @@ Use these keys in your YAML/JSON defaults file. CLI flags override values here.
 - quiet: boolean; suppress Nornir headers and print only raw outputs.
 - dry_run: boolean; preview config mode without pushing.
 - env_file: path to a `.env` file to auto-load.
+- live_progress: boolean; stream progress in real time while tasks run.
 
 Precedence reminder: CLI > defaults file > environment variables > hard-coded defaults.
