@@ -1,0 +1,15 @@
+.env
+venv
+__pycache__
+.pytest_cache
+.DS_Store
+outputs/
+*.pyc
+defaults*.yaml
+defaults*.yml
+defaults*.json
+hosts.txt
+commands.txt
+lab
+
+

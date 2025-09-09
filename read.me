@@ -1,0 +1,143 @@
+Nornir General Runner
+=====================
+
+This repository provides a general-purpose Python 3 script using Nornir to connect to network devices (routers/switches), run show commands or push configuration, and handle multiple hosts, ports, and credential fallbacks with configurable concurrency.
+
+Quick Start
+-----------
+
+1) Create a defaults file (YAML or JSON) for ports, credentials, and other settings. Example YAML in `lab/defaults.yaml`:
+
+```
+ports: [22, 2222]
+credentials:
+  - username: netops
+    password: supersecret
+  - username: backup
+    password: backuppass
+platform: cisco_ios
+workers: 20
+timeout: 30
+# enable_secret: enablepass
+```
+
+Note: `.env` is now reserved for inventory source variables only (e.g., `INVENTORY_DIR`, `NETBOX_URL/TOKEN`). See `.env.example`.
+
+2) Install dependencies:
+
+```
+pip install -r requirements.txt
+```
+
+3) Run the script:
+
+Show mode (read-only):
+
+```
+python nornir_runner.py \
+  --hosts 10.0.0.1,10.0.0.2 \
+  --commands "show version","show ip int br" \
+  --defaults-file lab/defaults.yaml \
+  --mode show
+```
+
+Config mode (push configuration):
+
+```
+python nornir_runner.py \
+  --hosts-file hosts.txt \
+  --commands-file cmds.txt \
+  --defaults-file lab/defaults.yaml \
+  --mode config
+```
+
+You can still override ports on the CLI (highest precedence, otherwise `--defaults-file`, then env, then `22`):
+
+```
+python nornir_runner.py --hosts 10.0.0.1 --commands "show clock" --defaults-file lab/defaults.yaml --ports 22,2201
+```
+
+Outputs
+-------
+
+- Results print to stdout. Optionally save per-host output files with `--save-dir outputs`.
+
+Notes
+-----
+
+- The script tries all provided SSH ports and credential pairs per host until a combination works.
+- `--platform` sets Netmiko `device_type` (e.g., `cisco_ios`, `arista_eos`, `mikrotik_routeros`). Prefer `platform` in `--defaults-file`; env `NORNIR_PLATFORM` is a fallback.
+- For show commands that require enable mode, prefer `enable_secret` in `--defaults-file`; env `NORNIR_ENABLE_SECRET` is a fallback.
+- Concurrency is controlled by `--workers` (prefer in `--defaults-file`; env fallback `NORNIR_WORKERS`). Each host is handled in parallel; within a host, port/credential attempts are tried sequentially for reliability.
+
+Per-host Platform Override
+--------------------------
+
+- Supply per-host platform inline using `host|platform` tokens:
+
+```
+python nornir_runner.py \
+  --hosts 10.0.0.1|mikrotik_routeros,10.0.0.2|cisco_ios \
+  --commands "/system resource print" \
+  --mode show
+```
+
+YAML Inventory (SimpleInventory)
+--------------------------------
+
+- Use an existing Nornir SimpleInventory by pointing to its directory containing `hosts.yaml`, `groups.yaml`, `defaults.yaml`:
+
+```
+python nornir_runner.py \
+  --inventory-dir inventory/ \
+  --commands "show version" \
+  --defaults-file lab/defaults.yaml \
+  --mode show
+
+Defaults Precedence and Migration
+---------------------------------
+
+- Precedence: CLI > `--defaults-file` > environment variables > hard-coded defaults.
+- Credentials: prefer `--defaults-file` (`credentials` key). Legacy `NORNIR_CREDENTIALS` is still accepted if defaults file doesn’t provide credentials.
+- Other legacy envs (`NORNIR_SSH_PORTS`, `NORNIR_PLATFORM`, `NORNIR_WORKERS`, `NORNIR_CMD_TIMEOUT`, `NORNIR_ENABLE_SECRET`) are used only if not supplied by CLI or defaults file.
+- `.env` now only needs inventory-related variables (e.g., `INVENTORY_DIR`). See `.env.example` for placeholders.
+
+Output Mode
+-----------
+
+- Default mode prints one aggregated block per host.
+- Use `--per-command-output` to print each command result per host and hide the aggregated block:
+
+```
+python nornir_runner.py \
+  --hosts-file lab/hosts.txt \
+  --commands-file lab/commands.txt \
+  --defaults-file lab/defaults.yaml \
+  --mode show \
+  --per-command-output
+```
+
+- Use `--quiet` to suppress Nornir headers and show only raw device output (works with either aggregated or per-command mode):
+
+```
+python nornir_runner.py \
+  --hosts-file lab/hosts.txt \
+  --commands-file lab/commands.txt \
+  --defaults-file lab/defaults.yaml \
+  --mode show \
+  --quiet
+```
+```
+
+Dry-Run for Config
+------------------
+
+- Preview configuration without making changes:
+
+```
+python nornir_runner.py \
+  --hosts 10.0.0.2 \
+  --commands "interface loopback 9","description TEST" \
+  --mode config \
+  --dry-run
+```
