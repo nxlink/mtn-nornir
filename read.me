@@ -32,6 +32,7 @@ commands: ["show version", "show ip int br"]
 
 # Outputs and behavior flags
 save_dir: compliance/backups
+log_file: logs/session.log
 per_command_output: false
 quiet: false
 dry_run: false
@@ -196,5 +197,8 @@ Use these keys in your YAML/JSON defaults file. CLI flags override values here.
 - dry_run: boolean; preview config mode without pushing.
 - env_file: path to a `.env` file to auto-load.
 - live_progress: boolean; stream progress in real time while tasks run.
+- live_table: boolean; show a live table with worker slot, host, status.
+- log_file: path; write screen output to this file instead of stdout (live progress/table still prints).
+  - Log entries are timestamped as `YYYY-MM-DD HH:MM:SS` per line.
 
 Precedence reminder: CLI > defaults file > environment variables > hard-coded defaults.

@@ -70,6 +70,9 @@ from nornir.core.task import Task, Result
 from nornir_utils.plugins.functions import print_result
 import logging
 from nornir_netmiko.tasks import netmiko_send_command, netmiko_send_config
+import io
+from contextlib import redirect_stdout
+from datetime import datetime
 try:
     from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException  # type: ignore
 except Exception:
@@ -79,6 +82,208 @@ try:
     from paramiko.ssh_exception import SSHException  # type: ignore
 except Exception:  # pragma: no cover
     SSHException = tuple()  # type: ignore
+import threading
+import time
+
+
+class ProgressTable:
+    """Thread-safe, colorful live table for worker slots.
+
+    Shows columns: Slot, Host, Status, Attempts, Time. Uses ANSI colors and a spinner.
+    """
+
+    # ANSI color codes
+    RESET = "\x1b[0m"
+    BOLD = "\x1b[1m"
+    DIM = "\x1b[2m"
+    FG_RED = "\x1b[31m"
+    FG_GREEN = "\x1b[32m"
+    FG_YELLOW = "\x1b[33m"
+    FG_BLUE = "\x1b[34m"
+    FG_MAGENTA = "\x1b[35m"
+    FG_CYAN = "\x1b[36m"
+    FG_WHITE = "\x1b[37m"
+
+    SPINNER_FRAMES = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"]
+
+    def __init__(self, num_slots: int):
+        self.num_slots = int(max(1, num_slots))
+        self._lock = threading.Lock()
+        self._host_to_slot: dict[str, int] = {}
+        self._rows: list[tuple[str, str]] = [("", "idle")] * self.num_slots
+        self._attempts: dict[str, int] = {}
+        self._start_ts: dict[str, float] = {}
+        self._frame = 0
+        self._stop = threading.Event()
+        self._renderer: threading.Thread | None = None
+        self._lines_printed = 0
+
+    @staticmethod
+    def _color_status(status: str) -> str:
+        s = status.lower()
+        if s.startswith("done") or s.startswith("connected"):
+            color = ProgressTable.FG_GREEN
+        elif s.startswith("failed") or s.startswith("error"):
+            color = ProgressTable.FG_RED
+        elif s.startswith("config"):
+            color = ProgressTable.FG_MAGENTA
+        elif s.startswith("show"):
+            color = ProgressTable.FG_CYAN
+        elif s.startswith("connect") or s.startswith("starting"):
+            color = ProgressTable.FG_YELLOW
+        elif s == "idle":
+            color = ProgressTable.DIM
+        else:
+            color = ProgressTable.FG_WHITE
+        # Pad already handled by caller; wrap with color
+        return f"{color}{status}{ProgressTable.RESET}"
+
+    def allocate(self, host: str) -> int:
+        with self._lock:
+            if host in self._host_to_slot:
+                return self._host_to_slot[host]
+            # find first idle slot
+            for idx, (h, status) in enumerate(self._rows):
+                if not h or status == "idle":
+                    self._rows[idx] = (host, "starting")
+                    self._host_to_slot[host] = idx
+                    self._attempts[host] = 0
+                    self._start_ts[host] = time.time()
+                    return idx
+            # if no idle slot (shouldn't happen given capacity), reuse last
+            idx = (len(self._rows) - 1)
+            self._rows[idx] = (host, "starting")
+            self._host_to_slot[host] = idx
+            self._attempts[host] = 0
+            self._start_ts[host] = time.time()
+            return idx
+
+    def update(self, host: str, status: str) -> None:
+        with self._lock:
+            slot = self._host_to_slot.get(host)
+            if slot is None:
+                slot = self.allocate(host)
+            # try to extract attempt number
+            st = status.lower()
+            if st.startswith("connect #"):
+                try:
+                    num = int(st.split("#", 1)[1].split()[0])
+                    self._attempts[host] = max(self._attempts.get(host, 0), num)
+                except Exception:
+                    pass
+            elif st.startswith("failed attempt"):
+                try:
+                    num = int(st.split()[2].rstrip(":"))
+                    self._attempts[host] = max(self._attempts.get(host, 0), num)
+                except Exception:
+                    pass
+            self._rows[slot] = (host, status)
+
+    def release(self, host: str, final_status: str | None = None) -> None:
+        with self._lock:
+            slot = self._host_to_slot.pop(host, None)
+            if slot is None:
+                return
+            if final_status:
+                # show final status briefly
+                self._rows[slot] = (host, final_status)
+            else:
+                self._rows[slot] = ("", "idle")
+            # keep attempts/start for a short time; cleaned on reuse
+
+    def _render_lines(self) -> list[str]:
+        with self._lock:
+            rows = list(self._rows)
+            attempts = dict(self._attempts)
+            starts = dict(self._start_ts)
+        self._frame = (self._frame + 1) % len(self.SPINNER_FRAMES)
+        spin = self.SPINNER_FRAMES[self._frame]
+
+        # column widths (widened status for longer messages)
+        w_slot, w_host, w_status, w_att, w_time = 4, 28, 50, 8, 6
+
+        def top_border():
+            return f"┌{'─'*w_slot}┬{'─'*w_host}┬{'─'*w_status}┬{'─'*w_att}┬{'─'*w_time}┐"
+
+        def mid_border():
+            return f"├{'─'*w_slot}┼{'─'*w_host}┼{'─'*w_status}┼{'─'*w_att}┼{'─'*w_time}┤"
+
+        def bot_border():
+            return f"└{'─'*w_slot}┴{'─'*w_host}┴{'─'*w_status}┴{'─'*w_att}┴{'─'*w_time}┘"
+
+        header = (
+            f"│{self.BOLD}{'Slot':^{w_slot}}{self.RESET}"
+            f"│{self.BOLD}{'Host':^{w_host}}{self.RESET}"
+            f"│{self.BOLD}{'Status':^{w_status}}{self.RESET}"
+            f"│{self.BOLD}{'Attempts':^{w_att}}{self.RESET}"
+            f"│{self.BOLD}{'Time':^{w_time}}{self.RESET}│"
+        )
+
+        lines = [self.FG_CYAN + top_border() + self.RESET, header, self.FG_CYAN + mid_border() + self.RESET]
+
+        now = time.time()
+        for i, (host, status) in enumerate(rows, start=1):
+            raw_host = host if host else "(idle)"
+            # time elapsed
+            start_ts = starts.get(host)
+            elapsed = int(now - start_ts) if (host and start_ts) else 0
+            mm = elapsed // 60
+            ss = elapsed % 60
+            tstr = f"{mm:02d}:{ss:02d}" if elapsed else "--:--"
+            # attempts
+            att = attempts.get(host, 0)
+            att_str = str(att) if att else "-"
+            # spinner active if not idle/done
+            s_lower = status.lower()
+            active = bool(host) and not (s_lower.startswith("done") or s_lower == "idle")
+            spin_char = spin if active else " "
+
+            # build padded cells (center all columns)
+            c_slot = f"{i:^{w_slot}}"
+            c_host = f"{raw_host:^{w_host}}"
+            status_with_spin = f"{spin_char} {status}" if active else f"  {status}"
+            c_status_plain = f"{status_with_spin:^{w_status}}"
+            c_status = self._color_status(c_status_plain)
+            c_att = f"{att_str:^{w_att}}"
+            c_time = f"{tstr:^{w_time}}"
+
+            lines.append(f"│{c_slot}│{c_host}│{c_status}│{c_att}│{c_time}│")
+
+        lines.append(self.FG_CYAN + bot_border() + self.RESET)
+        return lines
+
+    def start(self, interval: float = 0.2):
+        if self._renderer and self._renderer.is_alive():
+            return
+        self._stop.clear()
+
+        def _loop():
+            while not self._stop.is_set():
+                lines = self._render_lines()
+                self._print_lines(lines)
+                time.sleep(interval)
+            # final render on stop
+            self._print_lines(self._render_lines())
+
+        self._renderer = threading.Thread(target=_loop, name="progress-table", daemon=True)
+        self._renderer.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._renderer and self._renderer.is_alive():
+            self._renderer.join(timeout=1.0)
+
+    def _print_lines(self, lines: list[str]):
+        try:
+            # Move cursor up to overwrite previous frame
+            if self._lines_printed:
+                sys.stdout.write(f"\x1b[{self._lines_printed}A")
+            for ln in lines:
+                sys.stdout.write("\x1b[2K" + ln + "\n")  # clear line, print
+            sys.stdout.flush()
+            self._lines_printed = len(lines)
+        except Exception:
+            pass
 
 
 def announce(task: Task, message: str, level: int = logging.INFO, live: bool | None = None) -> Result:
@@ -187,6 +392,8 @@ class Defaults:
     dry_run: bool | None
     env_file: str | None
     live_progress: bool | None
+    live_table: bool | None
+    log_file: str | None
 
 
 def parse_credentials_mixed(value) -> List[Tuple[str, str]]:
@@ -244,6 +451,8 @@ def load_defaults_file(path: str | Path | None) -> Defaults:
             dry_run=None,
             env_file=None,
             live_progress=None,
+            live_table=None,
+            log_file=None,
         )
     p = Path(path)
     if not p.exists():
@@ -345,6 +554,16 @@ def load_defaults_file(path: str | Path | None) -> Defaults:
     else:
         live_progress = None
 
+    # live table (boolean)
+    live_table = data.get("live_table")
+    if isinstance(live_table, bool):
+        pass
+    else:
+        live_table = None
+
+    log_file = data.get("log_file")
+    log_file = str(log_file) if log_file is not None else None
+
     return Defaults(
         ports=ports,
         credentials=credentials,
@@ -364,6 +583,8 @@ def load_defaults_file(path: str | Path | None) -> Defaults:
         dry_run=dry_run,
         env_file=env_file,
         live_progress=live_progress,
+        live_table=live_table,
+        log_file=log_file,
     )
 
 
@@ -419,6 +640,7 @@ def try_connect_and_run(
     per_command_output: bool,
     suppress_output: bool,
     live_progress: bool,
+    progress_table: ProgressTable | None,
 ) -> Result:
     last_err: str | None = None
 
@@ -426,7 +648,11 @@ def try_connect_and_run(
     for port in ports:
         for username, password in cred_pairs:
             attempt += 1
+            if progress_table is not None:
+                progress_table.allocate(task.host.name)
             task.run(task=announce, message=f"Attempt {attempt}: connect {task.host.hostname}:{port} as {username}", live=live_progress)
+            if progress_table is not None:
+                progress_table.update(task.host.name, f"connect #{attempt} {task.host.hostname}:{port} as {username}")
             # Reset connection with new options each attempt
             task.host.close_connections()
             device_type = normalize_platform(getattr(task.host, "platform", None) or platform)
@@ -448,16 +674,22 @@ def try_connect_and_run(
             try:
                 task.host.get_connection("netmiko", task.nornir.config)
                 task.run(task=announce, message=f"Connected: {task.host.hostname}:{port} as {username}", live=live_progress)
+                if progress_table is not None:
+                    progress_table.update(task.host.name, f"connected {task.host.hostname}:{port} as {username}")
             except (Exception,) as e:
                 # Gracefully skip bad credentials/ports without creating failed child results
                 last_err = f"{type(e).__name__}: {e} (user={username}, port={port})"
                 task.run(task=announce, message=f"Failed attempt {attempt}: {last_err}", level=logging.WARNING, live=live_progress)
+                if progress_table is not None:
+                    progress_table.update(task.host.name, f"failed attempt {attempt}")
                 continue
 
             # Connection established; now run commands as tasks (these will reuse the open connection)
             try:
                 if mode == "show":
                     task.run(task=announce, message=f"Sending {len(commands)} command(s) in show mode", live=live_progress)
+                    if progress_table is not None:
+                        progress_table.update(task.host.name, f"show: {len(commands)} cmd(s)")
                     outputs = []
                     for cmd in commands:
                         r = task.run(
@@ -482,6 +714,8 @@ def try_connect_and_run(
                         task.host.close_connections()
                     finally:
                         task.run(task=announce, message="Closed connection", live=live_progress)
+                        if progress_table is not None:
+                            progress_table.release(task.host.name, final_status="done (show)")
                     return res
                 else:  # config mode
                     if dry_run:
@@ -493,9 +727,13 @@ def try_connect_and_run(
                             task.host.close_connections()
                         finally:
                             task.run(task=announce, message="Closed connection", live=live_progress)
+                            if progress_table is not None:
+                                progress_table.release(task.host.name, final_status="done (dry-run)")
                         return res
                     else:
-                        task.run(task=announce, message=f"Sending {len(commands)} command(s) in config mode")
+                        task.run(task=announce, message=f"Sending {len(commands)} command(s) in config mode", live=live_progress)
+                        if progress_table is not None:
+                            progress_table.update(task.host.name, f"config: {len(commands)} cmd(s)")
                         r = task.run(
                             name=f"{task.host.name} | config",
                             task=netmiko_send_config,
@@ -511,11 +749,15 @@ def try_connect_and_run(
                         try:
                             task.host.close_connections()
                         finally:
-                            task.run(task=announce, message="Closed connection")
+                            task.run(task=announce, message="Closed connection", live=live_progress)
+                            if progress_table is not None:
+                                progress_table.release(task.host.name, final_status="done (config)")
                         return res
             except Exception as e:
                 last_err = f"{type(e).__name__}: {e} (user={username}, port={port})"
                 task.run(task=announce, message=f"Error during session: {last_err}", level=logging.WARNING, live=live_progress)
+                if progress_table is not None:
+                    progress_table.update(task.host.name, "error; retrying")
                 continue
 
     # Exhausted all attempts
@@ -550,6 +792,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         ),
     )
     p.add_argument("--save-dir", help="Directory to save per-host outputs (optional)")
+    p.add_argument("--log-file", help="Write screen output to this file instead of stdout")
     p.add_argument(
         "--per-command-output",
         action="store_true",
@@ -559,6 +802,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         "--live-progress",
         action="store_true",
         help="Stream real-time progress of connection attempts and steps",
+    )
+    p.add_argument(
+        "--live-table",
+        action="store_true",
+        help="Render a live table showing worker slot, host, and status",
     )
     p.add_argument(
         "--quiet",
@@ -694,6 +942,13 @@ def main(argv: Iterable[str] | None = None) -> int:
     suppress_output = bool(save_dir_opt)
 
     effective_live_progress = bool(args.live_progress or (defaults.live_progress is True))
+    effective_live_table = bool(args.live_table or (defaults.live_table is True))
+
+    # Initialize live table renderer if requested
+    progress_table: ProgressTable | None = None
+    if effective_live_table:
+        progress_table = ProgressTable(num_slots=int(effective_workers))
+        progress_table.start()
 
     result = nr.run(
         name=f"run-{effective_mode}",
@@ -709,24 +964,63 @@ def main(argv: Iterable[str] | None = None) -> int:
         per_command_output=effective_per_cmd_out,
         suppress_output=suppress_output,
         live_progress=effective_live_progress,
+        progress_table=progress_table,
     )
+
+    # Stop live table renderer (if running) before printing results
+    if progress_table is not None:
+        progress_table.stop()
 
     # When saving outputs, suppress printing raw command output to screen but keep progress
     if suppress_output:
         effective_quiet = False
 
-    if not effective_quiet:
-        print_result(result)
+    # Determine logging to file vs stdout
+    log_file_opt = args.log_file or defaults.log_file
+
+    if not log_file_opt:
+        if not effective_quiet:
+            print_result(result)
+        else:
+            # Quiet mode: print only raw outputs (final task result per host)
+            for host, multi_result in result.items():
+                final_res = multi_result[-1] if len(multi_result) else None
+                if final_res is not None and final_res.result is not None:
+                    try:
+                        sys.stdout.write(str(final_res.result).rstrip("\n") + "\n")
+                    except Exception:
+                        # Best-effort; skip problematic encodings
+                        pass
     else:
-        # Quiet mode: print only raw outputs (final task result per host)
-        for host, multi_result in result.items():
-            final_res = multi_result[-1] if len(multi_result) else None
-            if final_res is not None and final_res.result is not None:
-                try:
-                    sys.stdout.write(str(final_res.result).rstrip("\n") + "\n")
-                except Exception:
-                    # Best-effort; skip problematic encodings
-                    pass
+        # Capture what would normally go to the screen and write it to a log file
+        buf = io.StringIO()
+        if not effective_quiet:
+            try:
+                with redirect_stdout(buf):
+                    print_result(result)
+            except Exception:
+                # Fallback: at least dump a simple summary
+                for host, multi_result in result.items():
+                    buf.write(f"[{host}] {"FAILED" if multi_result.failed else "OK"}\n")
+        else:
+            # Quiet mode: write only final raw results to log file
+            for host, multi_result in result.items():
+                final_res = multi_result[-1] if len(multi_result) else None
+                if final_res is not None and final_res.result is not None:
+                    buf.write(str(final_res.result).rstrip("\n") + "\n")
+
+        try:
+            log_path = Path(log_file_opt)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as fh:
+                raw = buf.getvalue()
+                if raw:
+                    lines = raw.splitlines()
+                    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    for ln in lines:
+                        fh.write(f"{stamp} {ln}\n")
+        except Exception as e:
+            print(f"Warn: failed to write log file {log_file_opt}: {e}", file=sys.stderr)
 
     # Optional save outputs per host
     if save_dir_opt:
