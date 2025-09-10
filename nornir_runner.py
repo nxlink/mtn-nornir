@@ -987,12 +987,14 @@ def main(argv: Iterable[str] | None = None) -> int:
         if not effective_quiet:
             print_result(result)
         else:
-            # Quiet mode: print only raw outputs (final task result per host)
+            # Quiet mode: print only the top-level task result per host
+            # Note: the last child may be a trailing announce (e.g., "Closed connection").
+            # The top-level task result is at index 0.
             for host, multi_result in result.items():
-                final_res = multi_result[-1] if len(multi_result) else None
-                if final_res is not None and final_res.result is not None:
+                top_res = multi_result[0] if len(multi_result) else None
+                if top_res is not None and top_res.result is not None:
                     try:
-                        sys.stdout.write(str(final_res.result).rstrip("\n") + "\n")
+                        sys.stdout.write(str(top_res.result).rstrip("\n") + "\n")
                     except Exception:
                         # Best-effort; skip problematic encodings
                         pass
@@ -1008,11 +1010,11 @@ def main(argv: Iterable[str] | None = None) -> int:
                 for host, multi_result in result.items():
                     buf.write(f"[{host}] {"FAILED" if multi_result.failed else "OK"}\n")
         else:
-            # Quiet mode: write only final raw results to log file
+            # Quiet mode: write only the top-level task results to log file
             for host, multi_result in result.items():
-                final_res = multi_result[-1] if len(multi_result) else None
-                if final_res is not None and final_res.result is not None:
-                    buf.write(str(final_res.result).rstrip("\n") + "\n")
+                top_res = multi_result[0] if len(multi_result) else None
+                if top_res is not None and top_res.result is not None:
+                    buf.write(str(top_res.result).rstrip("\n") + "\n")
 
         try:
             log_path = Path(log_file_opt)
@@ -1032,12 +1034,12 @@ def main(argv: Iterable[str] | None = None) -> int:
         outdir = Path(save_dir_opt)
         outdir.mkdir(parents=True, exist_ok=True)
         for host, multi_result in result.items():
-            # The final return from try_connect_and_run is the last child Result
-            final_res = multi_result[-1] if len(multi_result) else None
+            # Persist the top-level task result (index 0), not the last child announce
+            top_res = multi_result[0] if len(multi_result) else None
             outfile = outdir / f"{host}.txt"
             try:
-                if final_res is not None:
-                    outfile.write_text(str(final_res.result) + "\n", encoding="utf-8")
+                if top_res is not None:
+                    outfile.write_text(str(top_res.result) + "\n", encoding="utf-8")
                 else:
                     outfile.write_text("\n", encoding="utf-8")
             except Exception as e:
