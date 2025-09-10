@@ -187,12 +187,14 @@ class ProgressTable:
             slot = self._host_to_slot.pop(host, None)
             if slot is None:
                 return
-            if final_status:
-                # show final status briefly
-                self._rows[slot] = (host, final_status)
-            else:
-                self._rows[slot] = ("", "idle")
-            # keep attempts/start for a short time; cleaned on reuse
+            # Immediately free the slot so it can be reused by the next host
+            self._rows[slot] = ("", "idle")
+            # Clear attempts and start time for this host
+            try:
+                self._attempts.pop(host, None)
+                self._start_ts.pop(host, None)
+            except Exception:
+                pass
 
     def _render_lines(self) -> list[str]:
         with self._lock:
