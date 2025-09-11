@@ -646,6 +646,7 @@ def try_connect_and_run(
     suppress_output: bool,
     live_progress: bool,
     progress_table: ProgressTable | None,
+    save_dir: str | None,
 ) -> Result:
     last_err: str | None = None
 
@@ -709,11 +710,26 @@ def try_connect_and_run(
                     aggregated = "\n".join(outputs)
                     task.host["used_username"] = username
                     task.host["used_port"] = port
+                    # Persist the final aggregated output directly on the host to avoid
+                    # any ambiguity with MultiResult ordering when saving later
+                    task.host["final_output"] = aggregated
                     if per_command_output:
                         # with per-command output, final aggregation is auxiliary; keep low severity
                         res = Result(host=task.host, result=aggregated, changed=False, severity_level=logging.DEBUG)
                     else:
                         res = Result(host=task.host, result=aggregated, changed=False, severity_level=(logging.DEBUG if suppress_output else logging.INFO))
+                    # Immediately persist to disk if requested (per-host, per-worker)
+                    if save_dir:
+                        try:
+                            outdir = Path(save_dir)
+                            outdir.mkdir(parents=True, exist_ok=True)
+                            outfile = outdir / f"{task.host.name}.txt"
+                            outfile.write_text(str(aggregated).rstrip("\n") + "\n", encoding="utf-8")
+                            task.host["saved_to_disk"] = True
+                        except Exception as _e:
+                            # Non-fatal; will attempt again in final aggregation phase
+                            pass
+
                     # Close connection and announce
                     try:
                         task.host.close_connections()
@@ -727,7 +743,18 @@ def try_connect_and_run(
                         preview = "\n".join(commands)
                         task.host["used_username"] = username
                         task.host["used_port"] = port
+                        task.host["final_output"] = f"DRY-RUN (no changes):\n{preview}"
                         res = Result(host=task.host, result=f"DRY-RUN (no changes):\n{preview}", changed=False, severity_level=(logging.DEBUG if suppress_output else logging.INFO))
+                        # Immediately persist to disk if requested (per-host, per-worker)
+                        if save_dir:
+                            try:
+                                outdir = Path(save_dir)
+                                outdir.mkdir(parents=True, exist_ok=True)
+                                outfile = outdir / f"{task.host.name}.txt"
+                                outfile.write_text((f"DRY-RUN (no changes):\n{preview}").rstrip("\n") + "\n", encoding="utf-8")
+                                task.host["saved_to_disk"] = True
+                            except Exception as _e:
+                                pass
                         try:
                             task.host.close_connections()
                         finally:
@@ -747,6 +774,17 @@ def try_connect_and_run(
                         )
                         task.host["used_username"] = username
                         task.host["used_port"] = port
+                        task.host["final_output"] = str(r.result)
+                        # Immediately persist to disk if requested (per-host, per-worker)
+                        if save_dir:
+                            try:
+                                outdir = Path(save_dir)
+                                outdir.mkdir(parents=True, exist_ok=True)
+                                outfile = outdir / f"{task.host.name}.txt"
+                                outfile.write_text(str(r.result).rstrip("\n") + "\n", encoding="utf-8")
+                                task.host["saved_to_disk"] = True
+                            except Exception as _e:
+                                pass
                         if per_command_output:
                             res = Result(host=task.host, result=str(r.result), changed=True, severity_level=logging.DEBUG)
                         else:
@@ -955,6 +993,13 @@ def main(argv: Iterable[str] | None = None) -> int:
         progress_table = ProgressTable(num_slots=int(effective_workers))
         progress_table.start()
 
+    # Ensure save directory exists before workers start (avoids race on first write)
+    if save_dir_opt:
+        try:
+            Path(save_dir_opt).mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
     result = nr.run(
         name=f"run-{effective_mode}",
         task=try_connect_and_run,
@@ -970,6 +1015,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         suppress_output=suppress_output,
         live_progress=effective_live_progress,
         progress_table=progress_table,
+        save_dir=save_dir_opt,
     )
 
     # Stop live table renderer (if running) before printing results
@@ -1034,12 +1080,36 @@ def main(argv: Iterable[str] | None = None) -> int:
         outdir = Path(save_dir_opt)
         outdir.mkdir(parents=True, exist_ok=True)
         for host, multi_result in result.items():
-            # Persist the top-level task result (index 0), not the last child announce
-            top_res = multi_result[0] if len(multi_result) else None
             outfile = outdir / f"{host}.txt"
             try:
-                if top_res is not None:
-                    outfile.write_text(str(top_res.result) + "\n", encoding="utf-8")
+                # Skip hosts already saved by the worker (best-effort check)
+                host_obj = nr.inventory.hosts[str(host)] if hasattr(nr, "inventory") else None
+                if host_obj is not None:
+                    try:
+                        if host_obj.get("saved_to_disk"):
+                            continue
+                    except Exception:
+                        pass
+                host_output = None
+                if host_obj is not None:
+                    try:
+                        host_output = host_obj.get("final_output")
+                    except Exception:
+                        host_output = None
+                if host_output is None:
+                    # Fallback: attempt to use the task's returned Result. In Nornir, the
+                    # returned Result is typically appended last, but earlier code assumed
+                    # index 0. Be defensive and pick the last element with a non-empty result.
+                    chosen = None
+                    for r in reversed(list(multi_result)):
+                        if getattr(r, "result", None):
+                            chosen = r
+                            break
+                    if chosen is not None:
+                        host_output = str(chosen.result)
+                # Write the determined output (or a newline if unavailable)
+                if host_output is not None:
+                    outfile.write_text(str(host_output).rstrip("\n") + "\n", encoding="utf-8")
                 else:
                     outfile.write_text("\n", encoding="utf-8")
             except Exception as e:
